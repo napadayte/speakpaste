@@ -1,5 +1,14 @@
 # Local / review (not for repo)
 REVIEW.md
+.claude/
+.remember/
+
+# SpeakPaste runtime files
+.speakpaste.lock
+*.log.old
+
+# Windows exe build
+build_venv/
 
 # macOS
 .DS_Store
@@ -37,6 +46,7 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!speakpaste_windows.spec
 
 # Installer logs
 pip-log.txt

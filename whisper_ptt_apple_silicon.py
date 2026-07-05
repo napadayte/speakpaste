@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Whisper-PTT (Apple Silicon): push-to-talk voice-to-text using mlx-whisper on Metal.
+SpeakPaste: push-to-talk voice-to-text using mlx-whisper on Metal.
 Hold hotkey -> speak -> release -> transcription pasted into the active window.
 
 Config: WHISPER_PTT_* env vars or .env file (see .env.example-apple-silicon).
@@ -9,19 +9,96 @@ Dependencies: mlx-whisper, pyaudio, keyboard, pyperclip, requests.
 Optional: Ollama for LLM transform.
 """
 
+# Hide from Dock BEFORE any other imports (prevents bounce icon during slow module loads)
+try:
+    from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+except Exception:
+    pass
+
+import atexit
+import fcntl
 import os
-import queue
-import subprocess
-import time
-import threading
-import collections
-import numpy as np
-import pyaudio
-import pyperclip
-import requests
-import mlx_whisper
+import shutil
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+def _rotate_log(path, max_bytes=5 * 1024 * 1024):
+    """Copy an oversized log to .old and truncate it in place.
+
+    Truncate (not rename): the C wrapper holds these files open in O_APPEND
+    mode, so a rename would silently redirect all future output to the .old file.
+    """
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > max_bytes:
+            shutil.copyfile(path, path + ".old")
+            os.truncate(path, 0)
+    except Exception:
+        pass
+
+
+_rotate_log(os.path.join(_script_dir, "whisper_ptt.log"))
+_rotate_log(os.path.join(_script_dir, "whisper_ptt.error.log"))
+
+_lock_path = os.path.join(_script_dir, ".speakpaste.lock")
+_lock_fd = open(_lock_path, "w")
+try:
+    fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    print("⚠️  SpeakPaste is already running. Exiting.")
+    raise SystemExit(0)
+
+def _cleanup_lock():
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+        _lock_fd.close()
+        os.unlink(_lock_path)
+    except Exception:
+        pass
+
+atexit.register(_cleanup_lock)
+
+import gc
+import re
+from collections import Counter
+import queue
+import subprocess
+import sys
+import time
+import threading
+import traceback
+
+
+def _fatal_alert(title, details):
+    """Show a blocking error dialog so startup failures aren't silent."""
+    try:
+        from AppKit import NSAlert, NSApplication
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(details)
+        alert.runModal()
+    except Exception:
+        pass
+
+
+try:
+    import numpy as np
+    import pyaudio
+    import pyperclip
+    import requests
+    import mlx_whisper
+    import mlx.core as mx
+except Exception as _import_error:
+    traceback.print_exc()
+    _fatal_alert(
+        "SpeakPaste failed to start",
+        f"{type(_import_error).__name__}: {_import_error}\n\n"
+        "Full traceback: whisper_ptt.error.log",
+    )
+    raise SystemExit(1)
+
 _env_path = os.path.join(_script_dir, ".env")
 try:
     from dotenv import load_dotenv
@@ -60,7 +137,10 @@ def _env(key, default, *, type_=str):
 # Whisper (DEVICE and COMPUTE_TYPE not needed — MLX uses Metal automatically)
 WHISPER_MODEL = _env("WHISPER_MODEL", "large-v3-turbo")
 WHISPER_LANGUAGE = _env("WHISPER_LANGUAGE", "en")
-WHISPER_INITIAL_PROMPT = _env("WHISPER_INITIAL_PROMPT", "English speech.")
+WHISPER_INITIAL_PROMPT = _env("WHISPER_INITIAL_PROMPT", "") or None
+# Unload the model after this many idle minutes to free ~1.5-2 GB RAM (0 = keep loaded).
+# Next transcription reloads it automatically (+1-3s once).
+MODEL_IDLE_UNLOAD_MIN = _env("MODEL_IDLE_UNLOAD_MIN", "30", type_=int)
 
 # Hotkey (hold to record, release to stop). Default: option
 HOTKEY = _env("HOTKEY", "option").strip().lower().replace(" ", "")
@@ -85,6 +165,11 @@ DEFAULT_LLM_TRANSFORM_PROMPT = """Fix the following speech-to-text transcription
 Transcription: {raw_text}"""
 LLM_TRANSFORM_PROMPT = _env("LLM_TRANSFORM_PROMPT", DEFAULT_LLM_TRANSFORM_PROMPT)
 
+# Sound feedback
+USE_SOUND = _env("USE_SOUND", "true", type_=bool)
+SOUND_START = _env("SOUND_START", "/System/Library/Sounds/Pop.aiff")
+SOUND_STOP = _env("SOUND_STOP", "/System/Library/Sounds/Glass.aiff")
+
 # Output: copy to clipboard and/or paste to active window
 COPY_TO_CLIPBOARD = _env("COPY_TO_CLIPBOARD", "true", type_=bool)
 PASTE_TO_ACTIVE_WINDOW = _env("PASTE_TO_ACTIVE_WINDOW", "true", type_=bool)
@@ -103,8 +188,7 @@ CHANNELS = 1
 CHUNK_SIZE = _env("CHUNK_SIZE", "1024", type_=int)
 AUDIO_FORMAT = pyaudio.paInt16
 
-# Prebuffer and padding
-PREBUFFER_SEC = _env("PREBUFFER_SEC", "0.5", type_=float)
+# Recording
 PADDING_SEC = _env("PADDING_SEC", "0.2", type_=float)
 MIN_FRAMES = _env("MIN_FRAMES", "5", type_=int)
 # Simple silence gate: max int16 amplitude below this is treated as silence.
@@ -138,91 +222,101 @@ def _resolve_model(name):
 
 
 # -----------------------------------------------------------------------------
-# Recording state and prebuffer
+# Recording state
 # -----------------------------------------------------------------------------
 
 _recording = False
 _audio_frames = []
-_prebuffer_deque = None
-_prebuffer_lock = threading.Lock()
-_prebuffer_running = True
+_rec_thread = None
+_mic_stream = None
 _pyaudio_instance = None
 _mlx_model_path = None
-_transcribe_queue = queue.Queue()
+_transcribe_queue = queue.Queue(maxsize=3)
 _model_ready = threading.Event()
-
-
-def _prebuffer_size():
-    return max(1, int(PREBUFFER_SEC * SAMPLE_RATE / CHUNK_SIZE))
+_last_audio_frames = None
 
 
 # -----------------------------------------------------------------------------
-# Audio: prebuffer and numpy conversion
+# Audio
 # -----------------------------------------------------------------------------
 
-_MIC_MAX_RETRIES = 5
-_MIC_RETRY_DELAY = 1.0
+def _play_sound(sound_path):
+    """Play a system sound via afplay in a background thread."""
+    if USE_SOUND and sound_path and os.path.isfile(sound_path):
+        def _play():
+            subprocess.run(["afplay", sound_path], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        threading.Thread(target=_play, daemon=True).start()
 
 
-def _open_microphone_stream():
-    """Open mic stream, retrying with PyAudio re-init on transient PortAudio errors."""
+def _reinit_pyaudio(verbose=True):
+    """Recreate the PyAudio instance when the audio subsystem is corrupted."""
     global _pyaudio_instance
-    for attempt in range(1, _MIC_MAX_RETRIES + 1):
+    try:
+        _pyaudio_instance.terminate()
+    except Exception:
+        pass
+    _pyaudio_instance = pyaudio.PyAudio()
+    if verbose:
+        print("🔄 PyAudio reinitialized")
+
+
+def _recording_worker():
+    """Open a fresh mic stream, read chunks, close when done."""
+    global _mic_stream
+    # A PyAudio instance caches the device list; after a device change/sleep the
+    # first open fails with AUHAL -10851 and can eat the whole recording.
+    # A fresh instance (~tens of ms) opens reliably on the first try.
+    _reinit_pyaudio(verbose=False)
+    for attempt in range(3):
         try:
-            return _pyaudio_instance.open(
+            _mic_stream = _pyaudio_instance.open(
                 format=AUDIO_FORMAT,
                 channels=CHANNELS,
                 rate=SAMPLE_RATE,
                 input=True,
                 frames_per_buffer=CHUNK_SIZE,
             )
-        except OSError as e:
-            print(f"⚠️  Mic open failed (attempt {attempt}/{_MIC_MAX_RETRIES}): {e}")
-            try:
-                _pyaudio_instance.terminate()
-            except Exception:
-                pass
-            time.sleep(_MIC_RETRY_DELAY * attempt)
-            _pyaudio_instance = pyaudio.PyAudio()
-    raise RuntimeError("Could not open microphone after retries — check audio permissions and device.")
-
-
-def prebuffer_worker():
-    """Background thread: read mic into ring buffer; when recording, also append to _audio_frames."""
-    global _recording, _audio_frames
-    stream = _open_microphone_stream()
-    while _prebuffer_running:
-        try:
-            chunk = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-        except OSError as e:
-            print(f"⚠️  Mic read error: {e} — reopening stream...")
-            try:
-                stream.stop_stream()
-                stream.close()
-            except Exception:
-                pass
-            try:
-                stream = _open_microphone_stream()
-            except RuntimeError:
-                print("❌ Mic recovery failed, prebuffer stopping.")
-                return
-            continue
-        except Exception:
             break
-        with _prebuffer_lock:
-            _prebuffer_deque.append(chunk)
-            if _recording:
-                _audio_frames.append(chunk)
-    stream.stop_stream()
-    stream.close()
+        except OSError as e:
+            print(f"❌ Mic open error (attempt {attempt + 1}/3): {e}")
+            _reinit_pyaudio()
+            if attempt == 2:
+                return
+    while _recording:
+        try:
+            chunk = _mic_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+        except OSError as e:
+            print(f"⚠️  Mic read error: {e}")
+            break
+        if _recording:
+            _audio_frames.append(chunk)
+    try:
+        _mic_stream.stop_stream()
+        _mic_stream.close()
+    except Exception:
+        pass
+    _mic_stream = None
+
+
+_hotkey_active = False
 
 
 def start_recording():
-    """Start recording: copy prebuffer into _audio_frames; _recording flag lets worker append."""
-    global _recording, _audio_frames
-    with _prebuffer_lock:
-        _audio_frames[:] = list(_prebuffer_deque)
+    """Start recording with a fresh mic stream each time."""
+    global _recording, _audio_frames, _rec_thread, _hotkey_active
+    if _recording:
+        return
+    _hotkey_active = True
+    if _rec_thread is not None and _rec_thread.is_alive():
+        _rec_thread.join(timeout=2)
+    _play_sound(SOUND_START)
+    _update_status_icon("recording")
+    time.sleep(0.15)
+    _audio_frames = []
     _recording = True
+    _rec_thread = threading.Thread(target=_recording_worker, daemon=True)
+    _rec_thread.start()
     print("🎙️ Recording...")
 
 
@@ -240,21 +334,108 @@ def frames_to_numpy(frames, prepend_silence_sec=0):
 # Transcription and LLM
 # -----------------------------------------------------------------------------
 
+TRANSCRIBE_MAX_RETRIES = 3
+
+_HALLUCINATION_PHRASES = {
+    "transcription by castingwords",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "subscribe to my channel",
+    "like and subscribe",
+    "subtitles by",
+    "translated by",
+    "продолжение следует",
+    "субтитры сделал",
+    "субтитры добавил",
+    "редактор субтитров",
+    "спасибо за просмотр",
+    "подписывайтесь на канал",
+}
+
+_PUNCT_RE = re.compile(r"[\s.…,!?;:]+")
+
+
+_TAIL_HALLUCINATIONS = re.compile(
+    r"[\s.,…]*(?:" + "|".join(re.escape(p) for p in _HALLUCINATION_PHRASES) + r")[\s.,…]*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_hallucination_tail(text):
+    cleaned = _TAIL_HALLUCINATIONS.sub("", text).rstrip(" .,…")
+    if cleaned != text:
+        print(f"🧹 Stripped hallucination tail: \"{text[len(cleaned):][:60]}\"")
+    return cleaned
+
+
+def _is_hallucination(text):
+    t = _PUNCT_RE.sub(" ", text.lower()).strip()
+    if not t:
+        return True
+    if t in _HALLUCINATION_PHRASES:
+        return True
+    for phrase in _HALLUCINATION_PHRASES:
+        cleaned = t.replace(phrase, "").strip()
+        if not cleaned:
+            return True
+    return False
+
+
+def _is_repetitive(text, threshold=3):
+    words = text.lower().split()
+    if len(words) < 4:
+        return False
+    for ngram_size in (1, 2, 3):
+        ngrams = [" ".join(words[i:i+ngram_size]) for i in range(len(words) - ngram_size + 1)]
+        counts = Counter(ngrams)
+        most_common_count = counts.most_common(1)[0][1]
+        if most_common_count >= threshold and most_common_count / len(ngrams) > 0.4:
+            return True
+    return False
+
+
 def transcribe(audio_np):
-    """Transcribe float32 numpy audio with mlx-whisper. Returns (text, language_code)."""
+    """Transcribe with retry logic. Returns (text, language_code)."""
     print("🔄 Transcribing...")
     t0 = time.time()
-    result = mlx_whisper.transcribe(
-        audio_np,
-        path_or_hf_repo=_mlx_model_path,
-        language=WHISPER_LANGUAGE,
-        initial_prompt=WHISPER_INITIAL_PROMPT,
-        fp16=True,
-    )
-    text = result["text"].strip()
-    lang = result.get("language", WHISPER_LANGUAGE)
-    print(f"📝 Whisper ({time.time() - t0:.1f}s): {text}")
-    return text, lang
+    kwargs = {
+        "path_or_hf_repo": _mlx_model_path,
+        "initial_prompt": WHISPER_INITIAL_PROMPT,
+        "fp16": True,
+        "condition_on_previous_text": False,
+        "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        "compression_ratio_threshold": 2.4,
+        "logprob_threshold": -1.0,
+        "no_speech_threshold": 0.6,
+    }
+    if WHISPER_LANGUAGE:
+        kwargs["language"] = WHISPER_LANGUAGE
+
+    last_error = None
+    for attempt in range(1, TRANSCRIBE_MAX_RETRIES + 1):
+        try:
+            result = mlx_whisper.transcribe(audio_np, **kwargs)
+            text = _strip_hallucination_tail(result["text"].strip())
+            lang = result.get("language", WHISPER_LANGUAGE or "auto")
+
+            if _is_hallucination(text) or _is_repetitive(text):
+                print(f"⚠️  Hallucination filtered: \"{text[:80]}\" (attempt {attempt})")
+                if attempt < TRANSCRIBE_MAX_RETRIES:
+                    kwargs["initial_prompt"] = None
+                    continue
+                return "", lang
+
+            print(f"📝 Whisper ({time.time() - t0:.1f}s): {text}")
+            return text, lang
+        except Exception as e:
+            last_error = e
+            print(f"⚠️  Transcription error (attempt {attempt}/{TRANSCRIBE_MAX_RETRIES}): {e}")
+            if attempt < TRANSCRIBE_MAX_RETRIES:
+                time.sleep(0.5)
+
+    print(f"❌ Transcription failed after {TRANSCRIBE_MAX_RETRIES} attempts: {last_error}")
+    return "", "unknown"
 
 
 def transform_with_llm(raw_text, detected_lang):
@@ -297,66 +478,72 @@ _KEY_CODES = {
     "escape": 53,
 }
 
-_MODIFIERS = {
-    "command": "command down",
-    "control": "control down",
-    "option": "option down",
-    "shift": "shift down",
+_CG_MODIFIER_FLAGS = {
+    "command": 0x100000,
+    "control": 0x040000,
+    "option":  0x080000,
+    "shift":   0x020000,
 }
 
 
-def _applescript_key_code(key_name, modifier=None):
-    """Send a key via AppleScript key code (layout-independent)."""
-    code = _KEY_CODES.get(key_name.lower())
-    using = _MODIFIERS.get(modifier) if modifier else None
-    if code is not None:
-        if using:
-            script = f'tell application "System Events" to key code {code} using {{{using}}}'
-        else:
-            script = f'tell application "System Events" to key code {code}'
-    elif using:
-        script = f'tell application "System Events" to keystroke "{key_name}" using {{{using}}}'
-    else:
-        script = f'tell application "System Events" to keystroke "{key_name}"'
-    subprocess.run(["osascript", "-e", script], check=False)
+def _send_key_via_cgevent(keycode, modifier=None):
+    """Send a keystroke via CGEvent (needs Accessibility)."""
+    from Quartz import (
+        CGEventCreateKeyboardEvent,
+        CGEventSetFlags,
+        CGEventPost,
+        kCGHIDEventTap,
+    )
+    flags = _CG_MODIFIER_FLAGS.get(modifier, 0) if modifier else 0
+    ev_down = CGEventCreateKeyboardEvent(None, keycode, True)
+    ev_up = CGEventCreateKeyboardEvent(None, keycode, False)
+    if flags:
+        CGEventSetFlags(ev_down, flags)
+        CGEventSetFlags(ev_up, flags)
+    CGEventPost(kCGHIDEventTap, ev_down)
+    CGEventPost(kCGHIDEventTap, ev_up)
 
 
 def _send_keys_after_paste():
-    """Parse KEYS_AFTER_PASTE (e.g. 'enter', 'ctrl+enter') and send via AppleScript."""
+    """Parse KEYS_AFTER_PASTE (e.g. 'enter', 'ctrl+enter') and send via CGEvent."""
     if not KEYS_AFTER_PASTE:
         return
     parts = KEYS_AFTER_PASTE.split("+")
     if len(parts) == 1:
-        _applescript_key_code(parts[0])
+        code = _KEY_CODES.get(parts[0].lower())
+        if code is not None:
+            _send_key_via_cgevent(code)
     else:
         modifier = parts[0].replace("ctrl", "control").replace("cmd", "command")
-        _applescript_key_code(parts[1], modifier=modifier)
+        code = _KEY_CODES.get(parts[1].lower())
+        if code is not None:
+            _send_key_via_cgevent(code, modifier=modifier)
 
 
 def paste_to_front(text):
-    """Copy to clipboard and/or paste to active window (Cmd+V via AppleScript on macOS)."""
+    """Copy to clipboard and paste to active window via CGEvent Cmd+V."""
     if not text.strip():
         print("❌ Empty text, skipping")
         return
     if not COPY_TO_CLIPBOARD and not PASTE_TO_ACTIVE_WINDOW:
         print("✅ Done (console only)")
         return
-    old = pyperclip.paste()
     pyperclip.copy(text)
     if COPY_TO_CLIPBOARD:
         print("📋 Copied to clipboard!")
     if PASTE_TO_ACTIVE_WINDOW:
-        _applescript_key_code("v", modifier="command")
-        time.sleep(0.1)
+        try:
+            _send_key_via_cgevent(9, modifier="command")
+        except Exception as e:
+            print(f"⚠️  Paste failed: {e}")
+            print("💡 Text is in clipboard — paste manually with Cmd+V")
+            return
+        time.sleep(0.15)
         if KEYS_AFTER_PASTE:
             time.sleep(0.05)
             _send_keys_after_paste()
         suffix = f' + "{KEYS_AFTER_PASTE.upper()}"' if KEYS_AFTER_PASTE else ""
         print(f"✅ Pasted to active window{suffix}!")
-        if CLIPBOARD_AFTER_PASTE_POLICY == "restore":
-            pyperclip.copy(old)
-        elif CLIPBOARD_AFTER_PASTE_POLICY == "clear":
-            pyperclip.copy("")
 
 
 # -----------------------------------------------------------------------------
@@ -369,44 +556,77 @@ def _transcription_worker():
     _mlx_model_path = _resolve_model(WHISPER_MODEL)
     print(f"⏳ Loading mlx-whisper model '{_mlx_model_path}'... (first run downloads from HuggingFace)")
     warmup_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
-    mlx_whisper.transcribe(
-        warmup_audio,
-        path_or_hf_repo=_mlx_model_path,
-        language=WHISPER_LANGUAGE,
-        fp16=True,
-        verbose=False,
-    )
+    kwargs = {
+        "path_or_hf_repo": _mlx_model_path,
+        "fp16": True,
+        "verbose": False,
+    }
+    if WHISPER_LANGUAGE:
+        kwargs["language"] = WHISPER_LANGUAGE
+    mlx_whisper.transcribe(warmup_audio, **kwargs)
+    mx.clear_cache()
     print("✅ mlx-whisper loaded!")
     _model_ready.set()
 
+    last_use = time.time()
+    model_unloaded = False
     while True:
-        frames = _transcribe_queue.get()
+        try:
+            frames = _transcribe_queue.get(timeout=60)
+        except queue.Empty:
+            if (MODEL_IDLE_UNLOAD_MIN > 0 and not model_unloaded
+                    and time.time() - last_use > MODEL_IDLE_UNLOAD_MIN * 60):
+                from mlx_whisper.transcribe import ModelHolder
+                ModelHolder.model = None
+                ModelHolder.model_path = None
+                mx.clear_cache()
+                gc.collect()
+                model_unloaded = True
+                print(f"💤 Model unloaded after {MODEL_IDLE_UNLOAD_MIN} min idle (RAM freed)")
+            continue
         if frames is None:
             break
-        audio_np = frames_to_numpy(frames, prepend_silence_sec=PADDING_SEC)
-        raw_text, lang = transcribe(audio_np)
-        if USE_LLM_TRANSFORM and raw_text.strip():
-            final_text = transform_with_llm(raw_text, lang)
-        else:
-            final_text = raw_text
-        paste_to_front(final_text)
+        try:
+            if model_unloaded:
+                print("⏳ Reloading model after idle...")
+                model_unloaded = False
+            audio_np = frames_to_numpy(frames, prepend_silence_sec=PADDING_SEC)
+            raw_text, lang = transcribe(audio_np)
+            if raw_text.strip():
+                if USE_LLM_TRANSFORM:
+                    final_text = transform_with_llm(raw_text, lang)
+                else:
+                    final_text = raw_text
+                paste_to_front(final_text)
+            else:
+                print("❌ Empty transcription, skipping paste")
+        except Exception as e:
+            print(f"❌ Transcription worker error: {e}")
+        # Free the Metal buffer cache (can hold hundreds of MB) — weights stay loaded.
+        mx.clear_cache()
+        last_use = time.time()
+        _update_status_icon("idle")
 
 
 def stop_recording_and_process():
-    """Stop recording, wait for last frames, then enqueue for transcription."""
-    global _recording
+    """Stop recording, close mic, then enqueue for transcription."""
+    global _recording, _rec_thread
     if not _recording:
         return
     _recording = False
-    time.sleep(0.15)
+    if _rec_thread:
+        _rec_thread.join(timeout=2)
+        _rec_thread = None
+    _update_status_icon("idle")
 
     frames = list(_audio_frames)
     duration_sec = len(frames) * CHUNK_SIZE / SAMPLE_RATE
-    print(f"⏹️ Recorded {duration_sec:.1f}s (with {PREBUFFER_SEC}s prebuffer)")
+    print(f"⏹️ Recorded {duration_sec:.1f}s")
 
     # Only process recordings longer than 0.7 seconds in total.
     if duration_sec <= 0.7 or len(frames) < MIN_FRAMES:
         print("❌ Recording too short")
+        _play_sound(SOUND_STOP)
         return
 
     # Simple silence / noise gate: skip very low-energy audio.
@@ -416,7 +636,108 @@ def stop_recording_and_process():
         print("❌ Audio too quiet / silence, skipping")
         return
 
-    _transcribe_queue.put(frames)
+    global _last_audio_frames
+    _last_audio_frames = frames
+    _update_status_icon("transcribing")
+    try:
+        _transcribe_queue.put_nowait(frames)
+    except queue.Full:
+        print("⚠️  Transcription queue full, dropping recording")
+        _update_status_icon("idle")
+        return
+    _play_sound(SOUND_STOP)
+
+
+def retranscribe_last():
+    """Re-transcribe the last recording without re-recording."""
+    if _last_audio_frames is None:
+        print("❌ No previous recording to retranscribe")
+        return
+    if _recording:
+        return
+    print("🔁 Retranscribing last recording...")
+    _update_status_icon("transcribing")
+    _transcribe_queue.put(list(_last_audio_frames))
+
+
+# -----------------------------------------------------------------------------
+# Menu bar status icon (in-process via PyObjC)
+# -----------------------------------------------------------------------------
+
+_SF_SYMBOLS = {
+    "idle": "mic.fill",
+    "recording": "record.circle",
+    "transcribing": "ellipsis.circle",
+}
+_status_item = None
+
+
+def _make_icon(symbol_name):
+    from AppKit import NSImage, NSImageSymbolConfiguration, NSFontWeightRegular
+    img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol_name, None)
+    if img:
+        cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(12, NSFontWeightRegular)
+        img = img.imageWithSymbolConfiguration_(cfg)
+        img.setTemplate_(True)
+    return img
+
+
+from Foundation import NSObject
+
+
+class _MenuDelegate(NSObject):
+    def retranscribe_(self, sender):
+        threading.Thread(target=retranscribe_last, daemon=True).start()
+
+
+_menu_delegate = None
+
+
+def _init_status_bar():
+    """Create the NSStatusItem on the main thread."""
+    global _status_item, _menu_delegate
+    from AppKit import NSStatusBar, NSSquareStatusItemLength, NSMenu, NSMenuItem
+
+    _status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+        NSSquareStatusItemLength
+    )
+    icon = _make_icon(_SF_SYMBOLS["idle"])
+    if icon:
+        _status_item.button().setImage_(icon)
+        _status_item.button().setTitle_("")
+    else:
+        _status_item.button().setTitle_("M")
+
+    _menu_delegate = _MenuDelegate.alloc().init()
+
+    menu = NSMenu.alloc().init()
+    retranscribe_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Retranscribe Last", "retranscribe:", "r"
+    )
+    retranscribe_item.setTarget_(_menu_delegate)
+    menu.addItem_(retranscribe_item)
+    menu.addItem_(NSMenuItem.separatorItem())
+    quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Quit SpeakPaste", "terminate:", "q"
+    )
+    menu.addItem_(quit_item)
+    _status_item.setMenu_(menu)
+    print("✅ Menu bar icon active")
+
+
+def _set_icon_on_main(symbol_name):
+    icon = _make_icon(symbol_name)
+    if icon and _status_item:
+        _status_item.button().setImage_(icon)
+
+
+def _update_status_icon(state):
+    """Update the menu bar SF Symbol icon. Thread-safe dispatch to main thread."""
+    if _status_item is None:
+        return
+    symbol = _SF_SYMBOLS.get(state, _SF_SYMBOLS["idle"])
+    from PyObjCTools import AppHelper
+    AppHelper.callAfter(_set_icon_on_main, symbol)
 
 
 # -----------------------------------------------------------------------------
@@ -429,16 +750,131 @@ def _on_hotkey_press(_event=None):
 
 
 def _on_hotkey_release(_event=None):
-    stop_recording_and_process()
+    global _hotkey_active
+    if _hotkey_active:
+        _hotkey_active = False
+        stop_recording_and_process()
+
+
+def _check_accessibility():
+    """Check if the process has macOS Accessibility permission and guide the user if not."""
+    try:
+        import ctypes
+        import ctypes.util
+        lib = ctypes.cdll.LoadLibrary(
+            ctypes.util.find_library("ApplicationServices")
+            or "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        trusted = lib.AXIsProcessTrusted()
+        if not trusted:
+            print()
+            print("  ⚠️  Accessibility permission required!")
+            print("  Hotkeys and paste won't work without it.")
+            print()
+            print("  Fix: System Settings → Privacy & Security → Accessibility")
+            print("        → enable SpeakPaste")
+            print()
+            subprocess.Popen(
+                ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return False
+    except Exception:
+        pass
+    return True
+
+
+_MODIFIER_KEYCODES = {
+    "option_r": 61, "opt_r": 61, "alt_r": 61, "right_option": 61, "right_alt": 61,
+    "option": 58, "opt": 58, "alt": 58,
+    "cmd": 55, "command": 55,
+    "cmd_r": 54, "command_r": 54,
+    "ctrl": 59, "control": 59,
+    "ctrl_r": 62, "control_r": 62, "right_ctrl": 62, "right_control": 62,
+    "shift": 56, "shift_r": 60, "right_shift": 60,
+}
+
+_MODIFIER_FLAGS = {
+    58: 0x080000, 61: 0x080000,
+    55: 0x100000, 54: 0x100000,
+    59: 0x040000, 62: 0x040000,
+    56: 0x020000, 60: 0x020000,
+}
 
 
 def _start_hotkey_listener_mac():
-    """Hotkey listener using pynput on macOS (no root required, Option supported)."""
+    """Hotkey listener using NSEvent monitors — doesn't interfere with fn/🌐 key."""
+    _check_accessibility()
+
+    from AppKit import NSEvent
+
+    NSFlagsChangedMask = 1 << 12
+    NSKeyDownMask = 1 << 10
+
+    hotkey_keycode = _MODIFIER_KEYCODES.get(HOTKEY_KEY.lower())
+    hotkey_is_modifier = hotkey_keycode is not None
+
+    mod_keycode = _MODIFIER_KEYCODES.get(HOTKEY_MODIFIER.lower()) if HOTKEY_MODIFIER else None
+    mod_flag = _MODIFIER_FLAGS.get(mod_keycode, 0) if mod_keycode else 0
+
+    if HOTKEY_MODIFIER is None and hotkey_is_modifier:
+        hotkey_flag = _MODIFIER_FLAGS.get(hotkey_keycode, 0)
+        _was_pressed = [False]
+
+        def flags_handler(event):
+            if event.keyCode() != hotkey_keycode:
+                return
+            is_down = bool(event.modifierFlags() & hotkey_flag)
+            if is_down and not _was_pressed[0]:
+                _was_pressed[0] = True
+                _on_hotkey_press()
+            elif not is_down and _was_pressed[0]:
+                _was_pressed[0] = False
+                _on_hotkey_release()
+
+        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(NSFlagsChangedMask, flags_handler)
+        print(f"🎯 Hotkey active (NSEvent, keycode={hotkey_keycode})")
+
+    elif HOTKEY_MODIFIER and not hotkey_is_modifier:
+        _CHAR_KEYCODES = {
+            "space": 49, "return": 36, "enter": 36, "tab": 48, "escape": 53,
+            "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7,
+            "c": 8, "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15,
+            "y": 16, "t": 17, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38,
+            "k": 40, "n": 45, "m": 46, "o": 31,
+        }
+        key_kc = _CHAR_KEYCODES.get(HOTKEY_KEY.lower())
+        _mod_held = [False]
+        _was_pressed = [False]
+
+        def flags_handler(event):
+            if event.keyCode() == mod_keycode:
+                _mod_held[0] = bool(event.modifierFlags() & mod_flag)
+                if not _mod_held[0] and _was_pressed[0]:
+                    _was_pressed[0] = False
+                    _on_hotkey_release()
+
+        def key_handler(event):
+            if event.keyCode() == key_kc and _mod_held[0] and not _was_pressed[0]:
+                _was_pressed[0] = True
+                _on_hotkey_press()
+
+        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(NSFlagsChangedMask, flags_handler)
+        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(NSKeyDownMask, key_handler)
+        print(f"🎯 Hotkey active (NSEvent, mod={HOTKEY_MODIFIER}, key={HOTKEY_KEY})")
+
+    else:
+        print(f"⚠️  Hotkey '{HOTKEY}' not supported natively, using pynput fallback")
+        _start_hotkey_listener_pynput()
+        return
+
+
+def _start_hotkey_listener_pynput():
+    """Fallback: pynput for non-modifier hotkeys."""
     try:
         from pynput import keyboard as pynput_keyboard
     except ImportError:
-        print("❌ pynput is required on macOS. Install with:")
-        print("   pip install pynput")
+        print("❌ pynput is required for this hotkey. pip install pynput")
         return
 
     Key = pynput_keyboard.Key
@@ -448,14 +884,16 @@ def _start_hotkey_listener_mac():
         if not name:
             return None
         n = str(name).strip().lower()
-        if n in ("cmd", "command", "⌘"):
-            return Key.cmd
-        if n in ("option", "opt", "alt", "⌥"):
-            return Key.alt
-        if n in ("ctrl", "control"):
-            return Key.ctrl
-        if n == "shift":
-            return Key.shift
+        mapping = {
+            "cmd": Key.cmd, "command": Key.cmd,
+            "option": Key.alt, "opt": Key.alt, "alt": Key.alt,
+            "option_r": Key.alt_r, "opt_r": Key.alt_r, "alt_r": Key.alt_r,
+            "ctrl": Key.ctrl, "control": Key.ctrl,
+            "ctrl_r": Key.ctrl_r, "control_r": Key.ctrl_r,
+            "shift": Key.shift, "shift_r": Key.shift_r,
+        }
+        if n in mapping:
+            return mapping[n]
         if n.startswith("f") and n[1:].isdigit():
             return getattr(Key, n, None)
         if len(n) == 1:
@@ -484,9 +922,6 @@ def _start_hotkey_listener_mac():
                 _on_hotkey_press()
 
     def on_release(key):
-        if key == Key.esc:
-            print("\n👋 Exiting...")
-            return False
         if HOTKEY_MODIFIER is None:
             if _matches(key, hotkey_key_spec):
                 _on_hotkey_release()
@@ -495,8 +930,9 @@ def _start_hotkey_listener_mac():
                 _on_hotkey_release()
         pressed.discard(key)
 
-    with pynput_keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+    return listener
 
 
 def _format_banner():
@@ -507,7 +943,7 @@ def _format_banner():
         return "║" + padded + "║"
     parts = [
         "╔" + "═" * w + "╗\n",
-        line("     🎤 Whisper-PTT (Apple Silicon / MLX) ready!", w - 1) + "\n",
+        line("     🎤 SpeakPaste ready!", w - 1) + "\n",
         line("") + "\n",
         line(f'     Hotkey: "{HOTKEY.upper()}" (hold to record, release to transcribe)') + "\n",
         line(f"     Model: {_mlx_model_path}") + "\n",
@@ -521,27 +957,43 @@ def _format_banner():
     return "".join(parts)
 
 
-def main():
-    global _pyaudio_instance, _prebuffer_deque
-
-    threading.Thread(target=_transcription_worker, daemon=True).start()
+def _setup_worker():
+    """Background thread: load model, init PyAudio, start hotkey listener."""
+    global _pyaudio_instance
     _model_ready.wait()
 
     _pyaudio_instance = pyaudio.PyAudio()
-    _prebuffer_deque = collections.deque(maxlen=_prebuffer_size())
-
-    print(f"🎧 Prebuffer active (last {PREBUFFER_SEC}s)")
-    threading.Thread(target=prebuffer_worker, daemon=True).start()
 
     print(_format_banner())
     print(f'👂 Listening — hold "{HOTKEY.upper()}" to start recording.')
-
     _start_hotkey_listener_mac()
+
+
+def main():
+    _init_status_bar()
+
+    threading.Thread(target=_transcription_worker, daemon=True).start()
+    threading.Thread(target=_setup_worker, daemon=True).start()
+
+    atexit.register(lambda: _pyaudio_instance.terminate() if _pyaudio_instance else None)
+
+    from PyObjCTools import AppHelper
+    AppHelper.installMachInterrupt()
+    AppHelper.runEventLoop()
+
+    print("\n👋 Exiting...")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         print("\n👋 Exiting...")
         raise SystemExit(0)
+    except Exception as e:
+        traceback.print_exc()
+        _fatal_alert(
+            "SpeakPaste crashed",
+            f"{type(e).__name__}: {e}\n\nFull traceback: whisper_ptt.error.log",
+        )
+        raise SystemExit(1)

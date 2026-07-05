@@ -1,0 +1,37 @@
+name: Build Windows exe
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: >
+          pip install faster-whisper==1.2.1 ctranslate2==4.7.1
+          nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70
+          nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12
+          PyAudio==0.2.14 pyperclip pynput pystray Pillow python-dotenv requests numpy
+          pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --noconfirm speakpaste_windows.spec
+
+      - name: Add default .env
+        shell: cmd
+        run: copy installer\windows_default.env dist\SpeakPaste\.env
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpeakPaste-Windows
+          path: dist/SpeakPaste

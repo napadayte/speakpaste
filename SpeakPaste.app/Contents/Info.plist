@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>SpeakPaste</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.speakpaste.app</string>
+    <key>CFBundleName</key>
+    <string>SpeakPaste</string>
+    <key>CFBundleDisplayName</key>
+    <string>SpeakPaste</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSRequiresAquaSystemAppearance</key>
+    <false/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>SpeakPaste needs microphone access to transcribe your speech.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>SpeakPaste needs automation access to paste transcribed text into the active window.</string>
+</dict>
+</plist>
