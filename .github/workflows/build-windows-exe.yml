@@ -35,3 +35,5 @@ jobs:
         with:
           name: SpeakPaste-Windows
           path: dist/SpeakPaste
+          # .env is a hidden file and upload-artifact drops those by default
+          include-hidden-files: true
